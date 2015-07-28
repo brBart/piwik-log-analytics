@@ -367,6 +367,9 @@ _COMMON_LOG_FORMAT = (
 _NCSA_EXTENDED_LOG_FORMAT = (_COMMON_LOG_FORMAT +
     '\s+"(?P<referrer>.*?)"\s+"(?P<user_agent>.*?)"'
 )
+_MC_EXTENDED_LOG_FORMAT = (_NCSA_EXTENDED_LOG_FORMAT +
+    '\s+(?P<generation_time_micro>\S+)'
+)
 _S3_LOG_FORMAT = (
     '\S+\s+(?P<host>\S+)\s+\[(?P<date>.*?)\s+(?P<timezone>.*?)\]\s+(?P<ip>\S+)\s+'
     '\S+\s+\S+\s+\S+\s+\S+\s+"\S+\s+(?P<path>.*?)\s+\S+"\s+(?P<status>\S+)\s+\S+\s+(?P<length>\S+)\s+'
@@ -380,6 +383,7 @@ FORMATS = {
     'common': RegexFormat('common', _COMMON_LOG_FORMAT),
     'common_vhost': RegexFormat('common_vhost', _HOST_PREFIX + _COMMON_LOG_FORMAT),
     'ncsa_extended': RegexFormat('ncsa_extended', _NCSA_EXTENDED_LOG_FORMAT),
+    'mc_extended': RegexFormat('mc_extended', _MC_EXTENDED_LOG_FORMAT),
     'common_complete': RegexFormat('common_complete', _HOST_PREFIX + _NCSA_EXTENDED_LOG_FORMAT),
     'w3c_extended': W3cExtendedFormat(),
     'amazon_cloudfront': AmazonCloudFrontFormat(),
@@ -570,6 +574,10 @@ class Configuration(object):
         option_parser.add_option(
             '--skip', dest='skip', default=0, type='int',
             help="Skip the n first lines to start parsing/importing data at a given line for the specified log file",
+        )
+        option_parser.add_option(
+            '--auto-skip', dest='auto_skip', action='store_true', default=False,
+            help="Track logfile processing and automatically skip processed lines on the next run.  This allows multiple runs against an active logfile.",
         )
         option_parser.add_option(
             '--recorders', dest='recorders', default=1, type='int',
@@ -1908,6 +1916,26 @@ class Parser(object):
                     open_func = open
                 file = open_func(filename, 'r')
 
+        # If auto-skip and a real file, try and read the last marker
+        markerdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "skip-markers")
+        markerfile = os.path.join(markerdir, os.path.basename(filename + '_' + config.options.site_id) + ".marker")
+        skipmarker = None
+        first_line = None
+        if config.options.auto_skip and file != sys.stdin:
+            first_line = file.readline()
+            file.seek(0)
+            if os.path.exists(markerfile):
+                with open(markerfile, 'r') as f:
+                    try:
+                        data = json.load(f)
+                        if((data["checksummd5"] == 0) or (hashlib.md5(first_line).hexdigest() != data["checksummd5"])):
+                            skipmarker = None
+                        else:
+                            skipmarker = int(data["lineno"])
+                        #skipmarker = int(f.readline())
+                    except:
+                        skipmarker = None
+
         if config.options.show_progress:
             print 'Parsing log %s...' % filename
 
@@ -1953,6 +1981,9 @@ class Parser(object):
 
         hits = []
         for lineno, line in enumerate(file):
+            logging.debug('---------------------------')
+            logging.debug('------Parse new line-------')
+
             try:
                 line = line.decode(config.options.encoding)
             except UnicodeDecodeError:
@@ -1960,7 +1991,14 @@ class Parser(object):
                 continue
 
             stats.count_lines_parsed.increment()
-            if stats.count_lines_parsed.value <= config.options.skip:
+            logging.debug('Line %s', line)
+            if(skipmarker):
+                logging.debug('SkipMarker -> %d, CurrentLine -> %d', skipmarker, lineno)
+            else:
+                logging.debug('SkipMarker -> None, CurrentLine -> %d', lineno)
+
+            if ((stats.count_lines_parsed.value <= config.options.skip) or (skipmarker and lineno <= skipmarker)):
+                logging.debug('Skip line')
                 continue
 
             match = format.match(line)
@@ -2123,6 +2161,16 @@ class Parser(object):
                 Recorder.add_hits(hits)
                 hits = []
 
+            # If auto-skip, write the file marker
+            if config.options.auto_skip and file != sys.stdin:
+                # First, make sure the directory exists, in the same place as this script
+                if not os.path.isdir(markerdir):
+                    os.makedirs(markerdir)
+                # Write the ending lineno to the marker file
+                with open(markerfile, 'w') as f:
+                    data = {"checksummd5": hashlib.md5(first_line).hexdigest(), "lineno": lineno+1, "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} 
+                    json.dump(data, f)
+
         # add last chunk of hits
         if len(hits) > 0:
             Recorder.add_hits(hits)
@@ -2168,12 +2216,30 @@ def main():
     stats.print_summary()
 
 def fatal_error(error, filename=None, lineno=None):
+    
     print >> sys.stderr, 'Fatal error: %s' % error
     if filename and lineno is not None:
         print >> sys.stderr, (
             'You can restart the import of "%s" from the point it failed by '
             'specifying --skip=%d on the command line.\n' % (filename, lineno)
         )
+        # If auto-skip, write the file marker
+        if config.options.auto_skip and site_id and filename != '-':
+            markerdir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "skip-markers")    
+            markerfile = os.path.join(markerdir, os.path.basename(filename + '_' + config.options.site_id) + ".marker")
+            # First, make sure the directory exists, in the same place as this script
+            if not os.path.isdir(markerdir):
+                os.makedirs(markerdir)
+            # Write the ending lineno to the marker file
+            with open(markerfile, 'w') as f:
+                try:
+                    data = json.load(f)
+                    data["lineno"] = lineno
+                    #skipmarker = int(f.readline())
+                except:
+                    data = {"lineno": lineno, "checksummd5": ""};
+                
+                f.write(str(lineno))
     os._exit(1)
 
 if __name__ == '__main__':
